@@ -1,12 +1,12 @@
 # rperf-remote
 
-Remote rPerf estimator for AIX LPARs, a thin-remote adaptation of [Nigel Griffiths' `rperf` script](https://github.com/nigelargriffiths/rperf) that runs from a central jumphost against any LPAR over SSH, with no installation required on the target.
+Remote rPerf estimator for AIX LPARs — a thin-remote adaptation of [Nigel Griffiths' `rperf` script](https://github.com/nigelargriffiths/rperf) that runs from a central jumphost against any LPAR over SSH, with no installation required on the target.
 
 ---
 
 ## What it does
 
-Reports the **rPerf** (Relative Performance) figure for an AIX LPAR. rperf is IBM's published SPEC-derived performance number for Power Systems hardware. Useful for capacity planning, hardware refresh sizing, and fleet-wide baselining.
+Reports the **rPerf** (Relative Performance) figure for an AIX LPAR — IBM's published SPEC-derived performance number for Power Systems hardware. Useful for capacity planning, hardware refresh sizing, and fleet-wide baselining.
 
 For each target LPAR, it produces a line like:
 
@@ -15,15 +15,15 @@ trips-testlab 20.23 rPerf estimated based on 1.00 Virtual CPU cores
 trips-testlab 20.23 rPerf estimated based on 1.00 Uncapped Entitlement CPU cores
 ```
 
-The number isn't measured live, it's a lookup against IBM's published Power Systems Facts and Features data, scaled to the LPAR's visible CPU count. Same methodology as the upstream script, just executed remotely.
+The number isn't measured live — it's a lookup against IBM's published Power Systems Facts and Features data, scaled to the LPAR's visible CPU count. Same methodology as the upstream script, just executed remotely.
 
 ---
 
 ## Why this exists
 
-Upstream `rperf` is a single ksh93 script you have to copy to and execute on each LPAR you want to query. That works fine for a handful of boxes but becomes tedious across a real fleet when copying scripts around, dealing with version drift between hosts, getting permissions right per LPAR.
+Upstream `rperf` is a single ksh93 script you have to copy to and execute on each LPAR you want to query. That works fine for a handful of boxes but becomes tedious across a real fleet — copying scripts around, dealing with version drift between hosts, getting permissions right per LPAR.
 
-This adaptation reverses the model: the script runs once on a central jumphost (Linux or AIX), SSHes to each LPAR to gather only the raw discovery data (`lsattr`, `lsdev`, `lparstat`), then performs all the rounding, lookup, and scaling locally. The lookup table is updated in one place so no per-host script distribution!
+This adaptation reverses the model: the script runs once on a central jumphost (Linux or AIX), SSHes to each LPAR to gather only the raw discovery data (`lsattr`, `lsdev`, `lparstat`), then performs all the rounding, lookup, and scaling locally. The lookup table is updated in one place — no per-host script distribution.
 
 ---
 
@@ -59,13 +59,13 @@ This adaptation reverses the model: the script runs once on a central jumphost (
 
 ### On the jumphost
 
-- **ksh93 installed** — AT&T `ksh93u+m`. On Ubuntu install via `apt install ksh` (the offline `.deb` is `ksh93u+m_<version>_amd64.deb` from the universe pool). Verify with `ksh --version` - should report `Version AJM 93u+m/...`.
+- **ksh93 installed** — AT&T `ksh93u+m`. On Ubuntu install via `apt install ksh` (the offline `.deb` is `ksh93u+m_<version>_amd64.deb` from the universe pool). Verify with `ksh --version` — should report `Version AJM 93u+m/...`.
 - **OpenSSH 7.6+** for `StrictHostKeyChecking=accept-new` support. Older versions: edit the wrapper to use `StrictHostKeyChecking=no` instead, or pre-populate `~/.ssh/known_hosts` via `ssh-keyscan`.
-- **An SSH key** registered in the target user's `~/.ssh/authorized_keys` on each LPAR. Passphraseless (or loaded into `ssh-agent`) - the wrapper uses `BatchMode=yes` and won't tolerate prompts.
+- **An SSH key** registered in the target user's `~/.ssh/authorized_keys` on each LPAR. Passphraseless (or loaded into `ssh-agent`) — the wrapper uses `BatchMode=yes` and won't tolerate prompts.
 
 ### On each AIX LPAR
 
-Just SSH access. Any user with shell access can run `lsattr`/`lsdev`/`lparstat`
+Just SSH access. Any user with shell access can run `lsattr`/`lsdev`/`lparstat` — no special privileges needed.
 
 ---
 
@@ -150,6 +150,7 @@ rperf-remote [-evhHc] [-u user] [-t table] -        # read hosts from stdin
 | `-e` | Append entitlement-adjusted rating line per host |
 | `-h` | Prefix each output line with the LPAR's short hostname |
 | `-c` | CSV output mode (header + one row per host, machine-readable) |
+| `-j` | JSON output mode (array of objects, properly typed for `jq`/Python/etc.) |
 | `-H` | Help |
 | `-u user` | SSH username (default: current user) |
 | `-t table` | Path to `rperf.table` (default: alongside the wrapper) |
@@ -189,7 +190,7 @@ That `column`/`less` combo is the right way to read CSVs at the terminal:
 - `column -s, -t` — auto-aligns columns by comma separator
 - `less -#2` — left/right scroll moves 2 columns at a time
 - `less -N` — show line numbers
-- `less -S` — chop long lines instead of wrapping (essential - without `-S` rows wrap and become unreadable)
+- `less -S` — chop long lines instead of wrapping (essential — without `-S` rows wrap and become unreadable)
 
 **Pipe a host list from elsewhere:**
 ```bash
@@ -268,6 +269,42 @@ Failed hosts still get a row so you can see what was attempted. Filter for probl
 ```bash
 awk -F, '$NF != "ok" {print}' rperf-baseline-*.csv
 ```
+
+---
+
+### JSON (`-j`)
+
+Array of objects, one per host, with proper typing (numbers as numbers, `null` for missing values). Same 16 fields as CSV. Designed for `jq` pipelines and programmatic consumption.
+
+```json
+[
+    {"timestamp": "2026-05-06T09:51:08Z", "host": "p10-prod-01", "resolved_hostname": "p10-prod-01", "machine": "IBM,9080-HEX", "mhz_raw": 3650000000, "mhz_rounded": 3650, "cpus": 40, "proctype": "POWER10", "lookup_key": "IBM,9080-HEX_3650_40", "rating": 1366.80, "units": "rPerf", "estimated": "official", "mode": "Uncapped", "ent_cpu": 10.00, "ent_rating": 341.70, "status": "ok"},
+    {"timestamp": "2026-05-06T09:51:08Z", "host": "dead-host", "resolved_hostname": null, "machine": null, "mhz_raw": null, "mhz_rounded": null, "cpus": null, "proctype": null, "lookup_key": null, "rating": null, "units": null, "estimated": null, "mode": null, "ent_cpu": null, "ent_rating": null, "status": "ssh_fail"}
+]
+```
+
+**Use this when** you want to pipe results into `jq`, a Python script, or anything that prefers structured data over CSV. Examples:
+
+```bash
+# Top 5 LPARs by rating
+ksh rperf-remote -j -P 16 -f fleet.list \
+  | jq -r '.[] | select(.status=="ok") | "\(.rating)\t\(.host)"' \
+  | sort -rn | head -5
+
+# Hosts that failed
+ksh rperf-remote -j -P 16 -f fleet.list \
+  | jq -r '.[] | select(.status != "ok") | "\(.status)\t\(.host)"'
+
+# Aggregate fleet rPerf
+ksh rperf-remote -j -P 16 -f fleet.list \
+  | jq '[.[] | select(.status=="ok") | .rating] | add'
+
+# Hosts with estimated (vs official) ratings - candidates for table refinement
+ksh rperf-remote -j -P 16 -f fleet.list \
+  | jq -r '.[] | select(.estimated == "estimated") | "\(.host)\t\(.machine)\t\(.cpus)-core"'
+```
+
+The three output modes (`-c`, `-j`, `-v`) are mutually exclusive — pick the one that matches what'll consume the output.
 
 ---
 
@@ -353,16 +390,16 @@ If `rc=2` or you see "unknown option", your ksh doesn't support `wait -n` and th
 
 ### CSV columns look misaligned in `column -t`
 
-`column -t` doesn't handle quoted CSV — it just splits on the separator. Internal commas in `"IBM,9080-HEX"` get treated as field separators. Use a real CSV parser if you need precision, adjusting the "for c in row" value depending on how many viaible columns you want in your output:
+`column -t` doesn't handle quoted CSV — it just splits on the separator. Internal commas in `"IBM,9080-HEX"` get treated as field separators. Use a real CSV parser if you need precision:
 ```bash
 python3 -c "
 import csv, sys
 for row in csv.reader(open(sys.argv[1])):
-    print(' | '.join(f'{c:<20}' for c in row[:15]))
+    print(' | '.join(f'{c:<20}' for c in row[:5]))
 " rperf-baseline-20260506.csv
 ```
 
-For visual scanning, `column -s, -t < file | less -S` is good enough - the misalignment is cosmetic and wont be visible when parsed correctly.
+For visual scanning, `column -s, -t < file | less -S` is good enough — the misalignment is cosmetic.
 
 ---
 
@@ -386,6 +423,10 @@ For capacity planning, treat the figure as ±5% accurate. For hardware refresh s
 cd ~/jacks-stuff/rperf
 ksh rperf-remote -c -P 16 -u root -f fleet.list \
     > rperf-baseline-$(date +%Y%m%d).csv
+
+# Or as JSON for jq-based downstream processing
+ksh rperf-remote -j -P 16 -u root -f fleet.list \
+    > rperf-baseline-$(date +%Y%m%d).json
 
 # Optional: keep last 8 quarters, prune older
 find . -name 'rperf-baseline-*.csv' -mtime +730 -delete
@@ -443,3 +484,4 @@ Useful for capacity reviews — gives you a single "how much compute do we have"
 |---------|---------|
 | 1.0 | Initial thin-remote wrapper, single/multi/file/stdin host input, SSH key auth, externalised `rperf.table` |
 | 1.1 | Added `-P` parallelism (default 8 workers), `-c` CSV output mode, deterministic input-order output |
+| 1.2 | Added `-j` JSON output mode (array of properly typed objects, `null` for missing fields) |
