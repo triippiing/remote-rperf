@@ -1,0 +1,561 @@
+#!/usr/bin/env ksh
+#
+# rperf-remote v1.1
+#
+# Remote rPerf estimator for AIX LPARs - thin-remote adaptation of
+# Nigel Griffiths' rperf v43 (https://github.com/nigelargriffiths/rperf).
+#
+# Architecture: collects raw discovery data from target LPAR(s) via ssh,
+# performs all rounding / lookup / scaling locally. Target LPARs need only
+# stock AIX commands (lsattr, lsdev, lparstat, hostname) and ssh access.
+# Nothing is installed on the target.
+#
+# Usage:
+#   rperf-remote [-evhHc] [-u user] [-t table] [-f hostfile]
+#                [-P parallel] [host ...]
+#   rperf-remote [-evhHc] [-u user] [-t table] -        (read hosts from stdin)
+#
+# Flags mirror upstream rperf:
+#   -v   verbose mode (also enables -e)
+#   -e   show entitlement-adjusted rating
+#   -h   prepend hostname to each output line
+#   -H   help
+#
+# Wrapper additions:
+#   -u user     ssh username (default: current user)
+#   -t table    path to rperf.table (default: alongside this script)
+#   -f file     read hosts from file, one per line (# comments allowed)
+#   -           read hosts from stdin
+#   -P n        parallel ssh workers (default: 8, max: 64, 1 = sequential)
+#   -c          CSV output mode (header row + one row per host)
+#
+# Exit codes:
+#   0  all hosts processed (individual lookups may still be 'unknown')
+#   1  usage error
+#   2  table file not found / unreadable
+#   3  one or more hosts failed to respond
+#
+export LANG=C
+VERSION=1.1
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+DEFAULT_TABLE="$SCRIPT_DIR/rperf.table"
+DEFAULT_PARALLEL=8
+MAX_PARALLEL=64
+
+# ---------------------------------------------------------------------------
+# Defaults & flag parsing
+# ---------------------------------------------------------------------------
+verbose=0
+entmode=0
+showhost=0
+csvmode=0
+sshuser=""
+tablefile="$DEFAULT_TABLE"
+hostfile=""
+read_stdin=0
+parallel=$DEFAULT_PARALLEL
+
+usage()
+{
+    cat <<EOF
+rperf-remote v$VERSION - remote rPerf estimator for AIX LPARs
+
+Usage: $(basename $0) [-evhHc] [-u user] [-t table] [-f hostfile]
+                     [-P parallel] [host ...]
+       $(basename $0) [-evhHc] [-u user] [-t table] -
+
+  -v          verbose mode (implies -e); shows discovery values & lookup args
+  -e          output entitlement-adjusted rating (Capped/Uncapped + ent CPU)
+  -h          prepend hostname to each output line
+  -H          this help text
+  -c          CSV output mode (machine-readable, header + one row per host)
+  -u user     ssh username (default: current user)
+  -t table    path to rperf.table (default: $DEFAULT_TABLE)
+  -f file     read hosts from file (one per line, # for comments)
+  -           read hosts from stdin
+  -P n        parallel ssh workers (default: $DEFAULT_PARALLEL, max: $MAX_PARALLEL, 1=sequential)
+
+Examples:
+  $(basename $0) lpar01
+  $(basename $0) -veh -u root lpar01 lpar02 lpar03
+  $(basename $0) -h -P 16 -f /etc/aix-fleet.list
+  $(basename $0) -c -P 32 -f fleet.list > rperf-baseline.csv
+  cat hosts.txt | $(basename $0) -h -
+
+CSV columns:
+  timestamp,host,resolved_hostname,machine,mhz_raw,mhz_rounded,cpus,
+  proctype,lookup_key,rating,units,estimated,mode,ent_cpu,ent_rating,status
+
+Status values: ok | unknown_mtm | discovery_fail | ssh_fail
+EOF
+    exit 0
+}
+
+while getopts ehvHcu:t:f:P: opt
+do
+    case $opt in
+        v) verbose=1; entmode=1 ;;
+        e) entmode=1 ;;
+        h) showhost=1 ;;
+        H) usage ;;
+        c) csvmode=1 ;;
+        u) sshuser="$OPTARG" ;;
+        t) tablefile="$OPTARG" ;;
+        f) hostfile="$OPTARG" ;;
+        P) parallel="$OPTARG" ;;
+        ?) echo "Try '$(basename $0) -H' for help" >&2; exit 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+case $parallel in
+    ''|*[!0-9]*)
+        echo "rperf-remote: -P must be a positive integer" >&2
+        exit 1 ;;
+esac
+if (( parallel < 1 )); then parallel=1; fi
+if (( parallel > MAX_PARALLEL )); then parallel=$MAX_PARALLEL; fi
+
+if (( csvmode == 1 )) && (( verbose == 1 ))
+then
+    echo "rperf-remote: -c and -v are mutually exclusive" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Build the host list
+# ---------------------------------------------------------------------------
+typeset -a hosts
+hcount=0
+
+for h in "$@"
+do
+    if [[ "$h" == "-" ]]
+    then
+        read_stdin=1
+    else
+        hosts[$hcount]="$h"
+        ((hcount++))
+    fi
+done
+
+if [[ -n "$hostfile" ]]
+then
+    if [[ ! -r "$hostfile" ]]
+    then
+        echo "rperf-remote: cannot read hostfile: $hostfile" >&2
+        exit 1
+    fi
+    while read line
+    do
+        line=${line%%#*}
+        line=${line##+([[:space:]])}
+        line=${line%%+([[:space:]])}
+        [[ -z "$line" ]] && continue
+        hosts[$hcount]="$line"
+        ((hcount++))
+    done < "$hostfile"
+fi
+
+if (( read_stdin == 1 ))
+then
+    while read line
+    do
+        line=${line%%#*}
+        line=${line##+([[:space:]])}
+        line=${line%%+([[:space:]])}
+        [[ -z "$line" ]] && continue
+        hosts[$hcount]="$line"
+        ((hcount++))
+    done
+fi
+
+if (( hcount == 0 ))
+then
+    echo "rperf-remote: no hosts specified" >&2
+    echo "Try '$(basename $0) -H' for help" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Source the lookup table
+# ---------------------------------------------------------------------------
+if [[ ! -r "$tablefile" ]]
+then
+    echo "rperf-remote: cannot read table file: $tablefile" >&2
+    exit 2
+fi
+. "$tablefile"
+
+# ---------------------------------------------------------------------------
+# Workspace
+# ---------------------------------------------------------------------------
+WORKDIR=$(mktemp -d -t rperf-remote.XXXXXX)
+trap 'rm -rf "$WORKDIR"' EXIT INT TERM
+
+# ---------------------------------------------------------------------------
+# calculate / matchup - identical to upstream rperf
+# (operate on caller's vars: cpus, rating, estimated; respect $verbose)
+# ---------------------------------------------------------------------------
+calculate()
+{
+    if (( verbose == 1 ))
+    then
+        echo "calculate cpus=$cpus from $*"
+    fi
+    [[ -z "$1" ]] && return
+    if (( cpus == $1 )); then rating=$2; return; fi
+    if (( cpus < $1 )); then let rating=$2/$1*$cpus; estimated="estimated"; fi
+}
+
+matchup()
+{
+    if (( verbose == 1 )); then echo "matchup $*"; fi
+    rating=0
+    if (($#>=2));  then calculate $1 $2;     fi; if ((rating != 0)); then return; fi
+    if (($#>=4));  then calculate $3 $4;     fi; if ((rating != 0)); then return; fi
+    if (($#>=6));  then calculate $5 $6;     fi; if ((rating != 0)); then return; fi
+    if (($#>=8));  then calculate $7 $8;     fi; if ((rating != 0)); then return; fi
+    if (($#>=10)); then calculate $9 ${10};  fi; if ((rating != 0)); then return; fi
+    if (($#>=12)); then calculate ${11} ${12}; fi; if ((rating != 0)); then return; fi
+    if (($#>=14)); then calculate ${13} ${14}; fi; if ((rating != 0)); then return; fi
+    if (($#>=16)); then calculate ${15} ${16}; fi; if ((rating != 0)); then return; fi
+    if (($#>=18)); then calculate ${17} ${18}; fi; if ((rating != 0)); then return; fi
+    if (($#>=20)); then calculate ${19} ${20}; fi; if ((rating != 0)); then return; fi
+    if (($#>=22)); then calculate ${21} ${22}; fi; if ((rating != 0)); then return; fi
+    if (($#>=24)); then calculate ${23} ${24}; fi; if ((rating != 0)); then return; fi
+    if (($#>=26)); then calculate ${25} ${26}; fi; if ((rating != 0)); then return; fi
+    if (($#>=28)); then calculate ${27} ${28}; fi; if ((rating != 0)); then return; fi
+    if (($#>=30)); then calculate ${29} ${30}; fi; if ((rating != 0)); then return; fi
+    if (($#>=32)); then calculate ${31} ${32}; fi
+}
+
+# ---------------------------------------------------------------------------
+# Remote discovery payload
+# ---------------------------------------------------------------------------
+REMOTE_PAYLOAD='
+LANG=C; export LANG
+machine=`lsattr -El sys0 -a modelname -F value 2>/dev/null`
+cpus=`lsdev -Cc processor 2>/dev/null | grep Available | wc -l | sed "s/ //g"`
+procstr=`lsdev -Cc processor 2>/dev/null | grep Available | head -1 | cut -d" " -f1`
+proctype=`lsattr -El $procstr 2>/dev/null | awk "/^type/ {print \\$2}"`
+hz=`lsattr -El $procstr -a frequency -F value 2>/dev/null`
+shorthost=`hostname -s 2>/dev/null`
+mode=`lparstat -i 2>/dev/null | grep "^Mode" | awk "{print \\$(NF)}"`
+entcpu=`lparstat -i 2>/dev/null | grep "^Entitled Capacity " | grep -v Pool | awk "{print \\$(NF)}"`
+echo MACHINE=$machine
+echo CPUS=$cpus
+echo PROCSTR=$procstr
+echo PROCTYPE=$proctype
+echo HZ=$hz
+echo SHORTHOST=$shorthost
+echo MODE=$mode
+echo ENTCPU=$entcpu
+echo OK=1
+'
+
+# ---------------------------------------------------------------------------
+# CSV escape helper
+# ---------------------------------------------------------------------------
+csv_esc()
+{
+    typeset s="$1"
+    case "$s" in
+        *,*|*\"*)
+            s=${s//\"/\"\"}
+            echo "\"$s\""
+            ;;
+        *)
+            echo "$s"
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Per-host worker - results buffered to per-host workfiles for ordered output
+#
+# Workfile lines:
+#   STATUS=ok|ssh_fail|discovery_fail|unknown_mtm
+#   EXIT=0|3
+#   STDOUT:<line>     (zero or more)
+#   STDERR:<line>     (zero or more)
+# ---------------------------------------------------------------------------
+process_host()
+{
+    typeset target="$1"
+    typeset idx="$2"
+    typeset workfile="$WORKDIR/host.$idx"
+
+    typeset sshtarget
+    if [[ -n "$sshuser" ]]; then
+        sshtarget="${sshuser}@${target}"
+    else
+        sshtarget="$target"
+    fi
+
+    typeset machine="" cpus=0 procstr="" proctype="" Hz=""
+    typeset shorthost="" mode="" entcpu="" ok=0
+    typeset rating="" units="" estimated=""
+
+    typeset sshout sshrc
+    sshout=$(ssh -o BatchMode=yes -o ConnectTimeout=10 \
+                 -o StrictHostKeyChecking=accept-new \
+                 "$sshtarget" "$REMOTE_PAYLOAD" 2>/dev/null)
+    sshrc=$?
+
+    typeset ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    if (( sshrc != 0 ))
+    then
+        {
+            echo "STATUS=ssh_fail"
+            echo "EXIT=3"
+            if (( csvmode == 1 )); then
+                printf "STDOUT:%s,%s,,,,,,,,,,,,,,ssh_fail\n" \
+                       "$ts" "$(csv_esc "$target")"
+            fi
+            echo "STDERR:${target}: ssh failed (rc=$sshrc)"
+        } > "$workfile"
+        return
+    fi
+
+    while IFS='=' read key val
+    do
+        case $key in
+            MACHINE)   machine="$val" ;;
+            CPUS)      cpus="$val" ;;
+            PROCSTR)   procstr="$val" ;;
+            PROCTYPE)  proctype="$val" ;;
+            HZ)        Hz="$val" ;;
+            SHORTHOST) shorthost="$val" ;;
+            MODE)      mode="$val" ;;
+            ENTCPU)    entcpu="$val" ;;
+            OK)        ok="$val" ;;
+        esac
+    done <<EOF
+$sshout
+EOF
+
+    if (( ok != 1 )) || [[ -z "$machine" ]] || [[ -z "$Hz" ]]
+    then
+        {
+            echo "STATUS=discovery_fail"
+            echo "EXIT=3"
+            if (( csvmode == 1 )); then
+                printf "STDOUT:%s,%s,%s,%s,%s,,,,,,,,,,,discovery_fail\n" \
+                       "$ts" "$(csv_esc "$target")" "$(csv_esc "$shorthost")" \
+                       "$(csv_esc "$machine")" "$Hz"
+            fi
+            echo "STDERR:${target}: discovery failed (incomplete data from target)"
+        } > "$workfile"
+        return
+    fi
+
+    # MHz rounding
+    typeset -i MHz
+    if (( ($Hz % 1000000) >= 500000 )); then
+        (( MHz = ($Hz / 1000000) + 1 ))
+    else
+        (( MHz = ($Hz / 1000000) ))
+    fi
+    typeset dd=${MHz:0:2} ff=${MHz:2:9}
+    if (( ff < 10 )); then
+        ff=${ff//[0-9]/0}
+    elif (( ff > 90 )); then
+        ff=${ff//[0-9]/0}; let dd=$dd+1
+    elif (( ff > 40 )); then
+        if (( ff < 60 )); then ff=50; fi
+    fi
+    typeset roundedMHz=$dd$ff
+    typeset lookup="${machine}_${roundedMHz}_${cpus}"
+
+    # Capture verbose trace lines (matchup/calculate echoes) into a buffer.
+    # Use ksh-native pattern extraction rather than a piped/heredoc loop -
+    # those run in subshells that lose variable assignments.
+    # Note: separator is @ not | because ksh treats | as pattern alternation.
+    typeset trace_lines=""
+    if (( verbose == 1 )); then
+        typeset trace_output
+        trace_output=$(rperf_lookup 2>&1; echo "__RATING_RESULT=$rating@$units@$estimated")
+        trace_lines="${trace_output%__RATING_RESULT=*}"
+        typeset result="${trace_output##*__RATING_RESULT=}"
+        rating="${result%%@*}"
+        typeset rest="${result#*@}"
+        units="${rest%%@*}"
+        estimated="${rest#*@}"
+        trace_lines="${trace_lines%$'\n'}"
+    else
+        rperf_lookup
+    fi
+
+    # Compute entitlement rating
+    typeset entrating=""
+    if [[ "$rating" != "unknown" ]] && [[ -n "$entcpu" ]] && [[ -n "$mode" ]]
+    then
+        typeset singlecorefactor=$((1.00 / $cpus))
+        entrating=$(($rating * $singlecorefactor * $entcpu))
+    fi
+
+    typeset prefix=""
+    if (( showhost == 1 )); then
+        if [[ -n "$shorthost" ]]; then
+            prefix="$shorthost "
+        else
+            prefix="$target "
+        fi
+    fi
+
+    typeset status="ok"
+    [[ "$rating" == "unknown" ]] && status="unknown_mtm"
+
+    # ----- Build workfile -----
+    {
+        echo "STATUS=$status"
+        echo "EXIT=0"
+
+        if (( csvmode == 1 )); then
+            typeset rating_csv="$rating" entrating_csv=""
+            if [[ "$rating" != "unknown" ]]; then
+                rating_csv=$(printf "%.2f" $rating)
+                [[ -n "$entrating" ]] && entrating_csv=$(printf "%.2f" $entrating)
+            fi
+            printf "STDOUT:%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
+                "$ts" \
+                "$(csv_esc "$target")" \
+                "$(csv_esc "$shorthost")" \
+                "$(csv_esc "$machine")" \
+                "$Hz" \
+                "$roundedMHz" \
+                "$cpus" \
+                "$(csv_esc "$proctype")" \
+                "$(csv_esc "$lookup")" \
+                "$rating_csv" \
+                "$units" \
+                "$estimated" \
+                "$(csv_esc "$mode")" \
+                "$entcpu" \
+                "$entrating_csv" \
+                "$status"
+        else
+            if (( verbose == 1 )); then
+                echo "STDOUT:Information is from public documents from www.ibm.com"
+                echo "STDOUT:-- - IBM Power Systems Performance Report and Archive"
+                echo "STDOUT:-- - rperf-remote Version:$VERSION   Table:$tablefile"
+                echo "STDOUT:Host=$target Machine=$machine MHz=$MHz Rounded-MHz=$roundedMHz CPUs=$cpus CPU-Type=$proctype"
+                echo "STDOUT:lookup $lookup"
+                # Emit the captured trace lines (each prefixed STDOUT:)
+                if [[ -n "$trace_lines" ]]; then
+                    echo "$trace_lines" | while IFS= read tl; do
+                        echo "STDOUT:$tl"
+                    done
+                fi
+            fi
+
+            if [[ "$rating" == "unknown" ]]; then
+                printf "STDOUT:%sunknown unknown - no table entry for %s\n" "$prefix" "$lookup"
+            else
+                printf "STDOUT:%s%.2f %s %s based on %.2f Virtual CPU cores\n" \
+                       "$prefix" "$rating" "$units" "$estimated" "$cpus"
+                if (( entmode == 1 )) && [[ -n "$entrating" ]]; then
+                    printf "STDOUT:%s%.2f %s estimated based on %.2f %s Entitlement CPU cores\n" \
+                           "$prefix" "$entrating" "$units" "$entcpu" "$mode"
+                fi
+            fi
+        fi
+    } > "$workfile"
+}
+
+# ---------------------------------------------------------------------------
+# CSV header
+# ---------------------------------------------------------------------------
+if (( csvmode == 1 ))
+then
+    echo "timestamp,host,resolved_hostname,machine,mhz_raw,mhz_rounded,cpus,proctype,lookup_key,rating,units,estimated,mode,ent_cpu,ent_rating,status"
+fi
+
+# ---------------------------------------------------------------------------
+# Main loop with concurrency semaphore
+#
+# Tries `wait -n` (ksh93v+, recent versions) for true throttling. If unsupported
+# on this ksh, falls back to launching $parallel hosts in a batch and waiting
+# for the entire batch before launching the next batch. Slightly less efficient
+# but functionally equivalent on small fleets.
+# ---------------------------------------------------------------------------
+typeset -i exit_code=0
+typeset -i running=0
+typeset -i i=0
+typeset use_wait_n=1
+
+# Probe wait -n support. Different shells signal "unknown option" differently:
+#   - bash 4.3+: supports it natively (rc=0/1 on success/no children)
+#   - ksh AT&T 93u+m: prints usage, rc=2
+#   - older shells: command not found, rc=127
+# Treat ANY non-zero from the probe (with stderr suppressed) as "not supported".
+( true ) &
+wait -n 2>/dev/null
+if [[ $? -ne 0 ]]; then
+    use_wait_n=0
+fi
+
+if (( use_wait_n == 1 )); then
+    while (( i < hcount ))
+    do
+        while (( running >= parallel ))
+        do
+            wait -n
+            ((running--))
+        done
+        process_host "${hosts[$i]}" "$i" &
+        ((running++))
+        ((i++))
+    done
+    wait
+else
+    # Batch fallback
+    while (( i < hcount ))
+    do
+        typeset -i batch_end=$((i + parallel))
+        if (( batch_end > hcount )); then batch_end=$hcount; fi
+        while (( i < batch_end ))
+        do
+            process_host "${hosts[$i]}" "$i" &
+            ((i++))
+        done
+        wait
+    done
+fi
+
+# ---------------------------------------------------------------------------
+# Re-emit results in input order
+# ---------------------------------------------------------------------------
+i=0
+while (( i < hcount ))
+do
+    workfile="$WORKDIR/host.$i"
+    if [[ ! -f "$workfile" ]]; then
+        echo "rperf-remote: internal error - no workfile for host index $i (${hosts[$i]})" >&2
+        exit_code=3
+        ((i++))
+        continue
+    fi
+
+    while IFS= read line
+    do
+        case "$line" in
+            EXIT=*)
+                ec="${line#EXIT=}"
+                if (( ec != 0 )); then exit_code=$ec; fi
+                ;;
+            STDOUT:*)
+                echo "${line#STDOUT:}"
+                ;;
+            STDERR:*)
+                echo "${line#STDERR:}" >&2
+                ;;
+        esac
+    done < "$workfile"
+
+    ((i++))
+done
+
+exit $exit_code
