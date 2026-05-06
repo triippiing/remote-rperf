@@ -123,15 +123,6 @@ aix-dev-01
 aix-dev-02
 ```
 
-**Tip — generate from TSM node data:**
-```bash
-dsmadmc -id=admin -password=xxx -dataonly=yes \
-  "select node_name from nodes where platform_name='AIX'" \
-  | awk '{print tolower($1)}' > fleet.list
-```
-
-This is the most authoritative source — it's literally every AIX box being backed up.
-
 ---
 
 ## Usage
