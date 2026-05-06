@@ -1,12 +1,12 @@
 # rperf-remote
 
-Remote rPerf estimator for AIX LPARs — a thin-remote adaptation of [Nigel Griffiths' `rperf` script](https://github.com/nigelargriffiths/rperf) that runs from a central jumphost against any LPAR over SSH, with no installation required on the target.
+Remote rPerf estimator for AIX LPARs, a thin-remote adaptation of [Nigel Griffiths' `rperf` script](https://github.com/nigelargriffiths/rperf) that runs from a central jumphost against any LPAR over SSH, with no installation required on the target.
 
 ---
 
 ## What it does
 
-Reports the **rPerf** (Relative Performance) figure for an AIX LPAR — IBM's published SPEC-derived performance number for Power Systems hardware. Useful for capacity planning, hardware refresh sizing, and fleet-wide baselining.
+Reports the **rPerf** (Relative Performance) figure for an AIX LPAR. rperf is IBM's published SPEC-derived performance number for Power Systems hardware. Useful for capacity planning, hardware refresh sizing, and fleet-wide baselining.
 
 For each target LPAR, it produces a line like:
 
@@ -15,15 +15,15 @@ trips-testlab 20.23 rPerf estimated based on 1.00 Virtual CPU cores
 trips-testlab 20.23 rPerf estimated based on 1.00 Uncapped Entitlement CPU cores
 ```
 
-The number isn't measured live — it's a lookup against IBM's published Power Systems Facts and Features data, scaled to the LPAR's visible CPU count. Same methodology as the upstream script, just executed remotely.
+The number isn't measured live, it's a lookup against IBM's published Power Systems Facts and Features data, scaled to the LPAR's visible CPU count. Same methodology as the upstream script, just executed remotely.
 
 ---
 
 ## Why this exists
 
-Upstream `rperf` is a single ksh93 script you have to copy to and execute on each LPAR you want to query. That works fine for a handful of boxes but becomes tedious across a real fleet — copying scripts around, dealing with version drift between hosts, getting permissions right per LPAR.
+Upstream `rperf` is a single ksh93 script you have to copy to and execute on each LPAR you want to query. That works fine for a handful of boxes but becomes tedious across a real fleet when copying scripts around, dealing with version drift between hosts, getting permissions right per LPAR.
 
-This adaptation reverses the model: the script runs once on a central jumphost (Linux or AIX), SSHes to each LPAR to gather only the raw discovery data (`lsattr`, `lsdev`, `lparstat`), then performs all the rounding, lookup, and scaling locally. The lookup table is updated in one place — no per-host script distribution.
+This adaptation reverses the model: the script runs once on a central jumphost (Linux or AIX), SSHes to each LPAR to gather only the raw discovery data (`lsattr`, `lsdev`, `lparstat`), then performs all the rounding, lookup, and scaling locally. The lookup table is updated in one place so no per-host script distribution!
 
 ---
 
@@ -59,13 +59,13 @@ This adaptation reverses the model: the script runs once on a central jumphost (
 
 ### On the jumphost
 
-- **ksh93 installed** — AT&T `ksh93u+m`. On Ubuntu install via `apt install ksh` (the offline `.deb` is `ksh93u+m_<version>_amd64.deb` from the universe pool). Verify with `ksh --version` — should report `Version AJM 93u+m/...`.
+- **ksh93 installed** — AT&T `ksh93u+m`. On Ubuntu install via `apt install ksh` (the offline `.deb` is `ksh93u+m_<version>_amd64.deb` from the universe pool). Verify with `ksh --version` - should report `Version AJM 93u+m/...`.
 - **OpenSSH 7.6+** for `StrictHostKeyChecking=accept-new` support. Older versions: edit the wrapper to use `StrictHostKeyChecking=no` instead, or pre-populate `~/.ssh/known_hosts` via `ssh-keyscan`.
-- **An SSH key** registered in the target user's `~/.ssh/authorized_keys` on each LPAR. Passphraseless (or loaded into `ssh-agent`) — the wrapper uses `BatchMode=yes` and won't tolerate prompts.
+- **An SSH key** registered in the target user's `~/.ssh/authorized_keys` on each LPAR. Passphraseless (or loaded into `ssh-agent`) - the wrapper uses `BatchMode=yes` and won't tolerate prompts.
 
 ### On each AIX LPAR
 
-Just SSH access. Any user with shell access can run `lsattr`/`lsdev`/`lparstat` — no special privileges needed.
+Just SSH access. Any user with shell access can run `lsattr`/`lsdev`/`lparstat`
 
 ---
 
@@ -189,7 +189,7 @@ That `column`/`less` combo is the right way to read CSVs at the terminal:
 - `column -s, -t` — auto-aligns columns by comma separator
 - `less -#2` — left/right scroll moves 2 columns at a time
 - `less -N` — show line numbers
-- `less -S` — chop long lines instead of wrapping (essential — without `-S` rows wrap and become unreadable)
+- `less -S` — chop long lines instead of wrapping (essential - without `-S` rows wrap and become unreadable)
 
 **Pipe a host list from elsewhere:**
 ```bash
@@ -358,11 +358,11 @@ If `rc=2` or you see "unknown option", your ksh doesn't support `wait -n` and th
 python3 -c "
 import csv, sys
 for row in csv.reader(open(sys.argv[1])):
-    print(' | '.join(f'{c:<20}' for c in row[:5]))
+    print(' | '.join(f'{c:<20}' for c in row[:15]))
 " rperf-baseline-20260506.csv
 ```
 
-For visual scanning, `column -s, -t < file | less -S` is good enough — the misalignment is cosmetic.
+For visual scanning, `column -s, -t < file | less -S` is good enough - the misalignment is cosmetic and wont be visible when parsed correctly.
 
 ---
 
