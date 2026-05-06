@@ -36,7 +36,7 @@
 #   3  one or more hosts failed to respond
 #
 export LANG=C
-VERSION=1.1
+VERSION=1.2
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 DEFAULT_TABLE="$SCRIPT_DIR/rperf.table"
 DEFAULT_PARALLEL=8
@@ -49,6 +49,7 @@ verbose=0
 entmode=0
 showhost=0
 csvmode=0
+jsonmode=0
 sshuser=""
 tablefile="$DEFAULT_TABLE"
 hostfile=""
@@ -60,15 +61,16 @@ usage()
     cat <<EOF
 rperf-remote v$VERSION - remote rPerf estimator for AIX LPARs
 
-Usage: $(basename $0) [-evhHc] [-u user] [-t table] [-f hostfile]
+Usage: $(basename $0) [-evhHcj] [-u user] [-t table] [-f hostfile]
                      [-P parallel] [host ...]
-       $(basename $0) [-evhHc] [-u user] [-t table] -
+       $(basename $0) [-evhHcj] [-u user] [-t table] -
 
   -v          verbose mode (implies -e); shows discovery values & lookup args
   -e          output entitlement-adjusted rating (Capped/Uncapped + ent CPU)
   -h          prepend hostname to each output line
   -H          this help text
   -c          CSV output mode (machine-readable, header + one row per host)
+  -j          JSON output mode (array of objects, properly typed)
   -u user     ssh username (default: current user)
   -t table    path to rperf.table (default: $DEFAULT_TABLE)
   -f file     read hosts from file (one per line, # for comments)
@@ -80,18 +82,21 @@ Examples:
   $(basename $0) -veh -u root lpar01 lpar02 lpar03
   $(basename $0) -h -P 16 -f /etc/aix-fleet.list
   $(basename $0) -c -P 32 -f fleet.list > rperf-baseline.csv
+  $(basename $0) -j -P 32 -f fleet.list | jq '.[] | select(.status=="ok")'
   cat hosts.txt | $(basename $0) -h -
 
-CSV columns:
-  timestamp,host,resolved_hostname,machine,mhz_raw,mhz_rounded,cpus,
-  proctype,lookup_key,rating,units,estimated,mode,ent_cpu,ent_rating,status
+Output mode flags (-c, -j, -v) are mutually exclusive.
+
+CSV/JSON fields:
+  timestamp, host, resolved_hostname, machine, mhz_raw, mhz_rounded, cpus,
+  proctype, lookup_key, rating, units, estimated, mode, ent_cpu, ent_rating, status
 
 Status values: ok | unknown_mtm | discovery_fail | ssh_fail
 EOF
     exit 0
 }
 
-while getopts ehvHcu:t:f:P: opt
+while getopts ehvHcju:t:f:P: opt
 do
     case $opt in
         v) verbose=1; entmode=1 ;;
@@ -99,6 +104,7 @@ do
         h) showhost=1 ;;
         H) usage ;;
         c) csvmode=1 ;;
+        j) jsonmode=1 ;;
         u) sshuser="$OPTARG" ;;
         t) tablefile="$OPTARG" ;;
         f) hostfile="$OPTARG" ;;
@@ -116,9 +122,11 @@ esac
 if (( parallel < 1 )); then parallel=1; fi
 if (( parallel > MAX_PARALLEL )); then parallel=$MAX_PARALLEL; fi
 
-if (( csvmode == 1 )) && (( verbose == 1 ))
+# Output modes are mutually exclusive
+typeset -i modecount=$((csvmode + jsonmode + verbose))
+if (( modecount > 1 ))
 then
-    echo "rperf-remote: -c and -v are mutually exclusive" >&2
+    echo "rperf-remote: -c, -j, and -v are mutually exclusive" >&2
     exit 1
 fi
 
@@ -272,6 +280,42 @@ csv_esc()
 }
 
 # ---------------------------------------------------------------------------
+# JSON helpers
+# ---------------------------------------------------------------------------
+# json_str: escape a string for JSON (handles backslash, quote, control chars).
+# Empty input emits null (intentional - cleaner than "" for missing values).
+json_str()
+{
+    typeset s="$1"
+    if [[ -z "$s" ]]; then
+        echo "null"
+        return
+    fi
+    s=${s//\\/\\\\}        # backslash first
+    s=${s//\"/\\\"}        # then double-quote
+    s=${s//$'\t'/\\t}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    echo "\"$s\""
+}
+
+# json_num: emit a number unquoted, or null if empty/non-numeric
+json_num()
+{
+    typeset s="$1"
+    if [[ -z "$s" ]]; then
+        echo "null"
+        return
+    fi
+    # Match integer or decimal (including negative); anything else becomes null
+    case "$s" in
+        -*[!0-9.]*|*[!0-9.-]*|*..*|*-*-*) echo "null" ;;
+        *.*.*) echo "null" ;;
+        *) echo "$s" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # Per-host worker - results buffered to per-host workfiles for ordered output
 #
 # Workfile lines:
@@ -313,6 +357,9 @@ process_host()
             if (( csvmode == 1 )); then
                 printf "STDOUT:%s,%s,,,,,,,,,,,,,,ssh_fail\n" \
                        "$ts" "$(csv_esc "$target")"
+            elif (( jsonmode == 1 )); then
+                printf "STDOUT:    {\"timestamp\": %s, \"host\": %s, \"resolved_hostname\": null, \"machine\": null, \"mhz_raw\": null, \"mhz_rounded\": null, \"cpus\": null, \"proctype\": null, \"lookup_key\": null, \"rating\": null, \"units\": null, \"estimated\": null, \"mode\": null, \"ent_cpu\": null, \"ent_rating\": null, \"status\": \"ssh_fail\"}\n" \
+                       "$(json_str "$ts")" "$(json_str "$target")"
             fi
             echo "STDERR:${target}: ssh failed (rc=$sshrc)"
         } > "$workfile"
@@ -345,6 +392,11 @@ EOF
                 printf "STDOUT:%s,%s,%s,%s,%s,,,,,,,,,,,discovery_fail\n" \
                        "$ts" "$(csv_esc "$target")" "$(csv_esc "$shorthost")" \
                        "$(csv_esc "$machine")" "$Hz"
+            elif (( jsonmode == 1 )); then
+                printf "STDOUT:    {\"timestamp\": %s, \"host\": %s, \"resolved_hostname\": %s, \"machine\": %s, \"mhz_raw\": %s, \"mhz_rounded\": null, \"cpus\": null, \"proctype\": null, \"lookup_key\": null, \"rating\": null, \"units\": null, \"estimated\": null, \"mode\": null, \"ent_cpu\": null, \"ent_rating\": null, \"status\": \"discovery_fail\"}\n" \
+                       "$(json_str "$ts")" "$(json_str "$target")" \
+                       "$(json_str "$shorthost")" "$(json_str "$machine")" \
+                       "$(json_num "$Hz")"
             fi
             echo "STDERR:${target}: discovery failed (incomplete data from target)"
         } > "$workfile"
@@ -436,6 +488,30 @@ EOF
                 "$entcpu" \
                 "$entrating_csv" \
                 "$status"
+        elif (( jsonmode == 1 )); then
+            typeset rating_json="null" entrating_json="null" units_json="null"
+            if [[ "$rating" != "unknown" ]]; then
+                rating_json=$(printf "%.2f" $rating)
+                [[ -n "$entrating" ]] && entrating_json=$(printf "%.2f" $entrating)
+                units_json=$(json_str "$units")
+            fi
+            printf "STDOUT:    {\"timestamp\": %s, \"host\": %s, \"resolved_hostname\": %s, \"machine\": %s, \"mhz_raw\": %s, \"mhz_rounded\": %s, \"cpus\": %s, \"proctype\": %s, \"lookup_key\": %s, \"rating\": %s, \"units\": %s, \"estimated\": %s, \"mode\": %s, \"ent_cpu\": %s, \"ent_rating\": %s, \"status\": %s}\n" \
+                "$(json_str "$ts")" \
+                "$(json_str "$target")" \
+                "$(json_str "$shorthost")" \
+                "$(json_str "$machine")" \
+                "$(json_num "$Hz")" \
+                "$(json_num "$roundedMHz")" \
+                "$(json_num "$cpus")" \
+                "$(json_str "$proctype")" \
+                "$(json_str "$lookup")" \
+                "$rating_json" \
+                "$units_json" \
+                "$(json_str "$estimated")" \
+                "$(json_str "$mode")" \
+                "$(json_num "$entcpu")" \
+                "$entrating_json" \
+                "$(json_str "$status")"
         else
             if (( verbose == 1 )); then
                 echo "STDOUT:Information is from public documents from www.ibm.com"
@@ -466,11 +542,14 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# CSV header
+# CSV header / JSON array opener
 # ---------------------------------------------------------------------------
 if (( csvmode == 1 ))
 then
     echo "timestamp,host,resolved_hostname,machine,mhz_raw,mhz_rounded,cpus,proctype,lookup_key,rating,units,estimated,mode,ent_cpu,ent_rating,status"
+elif (( jsonmode == 1 ))
+then
+    echo "["
 fi
 
 # ---------------------------------------------------------------------------
@@ -527,7 +606,9 @@ fi
 
 # ---------------------------------------------------------------------------
 # Re-emit results in input order
+# In JSON mode, inject commas between objects (but not after the last one).
 # ---------------------------------------------------------------------------
+typeset -i json_emitted=0
 i=0
 while (( i < hcount ))
 do
@@ -547,7 +628,16 @@ do
                 if (( ec != 0 )); then exit_code=$ec; fi
                 ;;
             STDOUT:*)
-                echo "${line#STDOUT:}"
+                if (( jsonmode == 1 )); then
+                    # Prepend comma if this is not the first object emitted
+                    if (( json_emitted > 0 )); then
+                        echo ","
+                    fi
+                    printf "%s" "${line#STDOUT:}"
+                    ((json_emitted++))
+                else
+                    echo "${line#STDOUT:}"
+                fi
                 ;;
             STDERR:*)
                 echo "${line#STDERR:}" >&2
@@ -557,5 +647,12 @@ do
 
     ((i++))
 done
+
+# JSON array closer
+if (( jsonmode == 1 ))
+then
+    if (( json_emitted > 0 )); then echo ""; fi
+    echo "]"
+fi
 
 exit $exit_code
