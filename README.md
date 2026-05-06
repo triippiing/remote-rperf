@@ -353,7 +353,7 @@ If `rc=2` or you see "unknown option", your ksh doesn't support `wait -n` and th
 
 ### CSV columns look misaligned in `column -t`
 
-`column -t` doesn't handle quoted CSV — it just splits on the separator. Internal commas in `"IBM,9080-HEX"` get treated as field separators. Use a real CSV parser if you need precision:
+`column -t` doesn't handle quoted CSV — it just splits on the separator. Internal commas in `"IBM,9080-HEX"` get treated as field separators. Use a real CSV parser if you need precision, adjusting the "for c in row" value depending on how many viaible columns you want in your output:
 ```bash
 python3 -c "
 import csv, sys
